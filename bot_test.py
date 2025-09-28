@@ -8,18 +8,18 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 logger = logging.getLogger("bot-test")
 
 API_KEY = os.environ.get("API_KEY")
-API_KEY_SECRET = os.environ.get("API_KEY_SECRET")
+API_SECRET = os.environ.get("API_SECRET")
 ACCESS_TOKEN = os.environ.get("ACCESS_TOKEN")
 ACCESS_TOKEN_SECRET = os.environ.get("ACCESS_TOKEN_SECRET")
 
-if not all([API_KEY, API_KEY_SECRET, ACCESS_TOKEN, ACCESS_TOKEN_SECRET]):
+if not all([API_KEY, API_SECRET, ACCESS_TOKEN, ACCESS_TOKEN_SECRET]):
     logger.error("One or more required env vars are missing.")
     sys.exit(2)
 
 try:
     client = tweepy.Client(
         consumer_key=API_KEY,
-        consumer_secret=API_KEY_SECRET,
+        consumer_secret=API_SECRET,
         access_token=ACCESS_TOKEN,
         access_token_secret=ACCESS_TOKEN_SECRET,
         wait_on_rate_limit=True
