@@ -1,9 +1,7 @@
-name: x-retweet-bot
+name: x-retweet-bot (debug)
 
 on:
-  schedule:
-    - cron: '*/10 * * * *'  # 10分ごと（最短は5分間隔）
-  workflow_dispatch: {}  # 手動実行オプション
+  workflow_dispatch:
 
 jobs:
   run-bot:
@@ -12,18 +10,33 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Setup Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
-      - name: Install dependencies
-        run: pip install tweepy python-dotenv
+      - name: Install deps
+        run: pip install tweepy
 
-      - name: Run bot
+      - name: Inject secrets as env
         env:
           API_KEY: ${{ secrets.API_KEY }}
-          API_SECRET: ${{ secrets.API_SECRET }}
+          API_KEY_SECRET: ${{ secrets.API_KEY_SECRET }}
           ACCESS_TOKEN: ${{ secrets.ACCESS_TOKEN }}
           ACCESS_TOKEN_SECRET: ${{ secrets.ACCESS_TOKEN_SECRET }}
+        run: echo "envs set for later steps"
+
+      - name: Check env presence (debug)
         run: |
-          python bot_test.py
+          python - <<'PY'
+          import os
+          keys = ["API_KEY","API_KEY_SECRET","ACCESS_TOKEN","ACCESS_TOKEN_SECRET"]
+          print({k: bool(os.getenv(k)) for k in keys})
+          PY
+
+      - name: Run bot_test.py
+        env:
+          API_KEY: ${{ secrets.API_KEY }}
+          API_KEY_SECRET: ${{ secrets.API_KEY_SECRET }}
+          ACCESS_TOKEN: ${{ secrets.ACCESS_TOKEN }}
+          ACCESS_TOKEN_SECRET: ${{ secrets.ACCESS_TOKEN_SECRET }}
+        run: python bot_test.py
