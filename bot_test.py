@@ -31,8 +31,9 @@ try:
     tl = client.get_home_timeline(max_results=10, tweet_fields=["id","text","created_at"])
     tweets = tl.data or []
     logger.info(f"Retrieved {len(tweets)} tweets from home timeline (sample):")
-    for t in tweets[:5]:
-        logger.info(f"- [{t.id}] {t.text[:140].replace('\\n',' ')}")
+    for t in tweets:
+        text_preview = t.text[:140].replace("\n", " ")
+        logger.info(f"- [{t.id}] {text_preview}")
     logger.info("Auth & timeline test completed successfully.")
 except Exception as e:
     logger.exception("API call failed: %s", e)
