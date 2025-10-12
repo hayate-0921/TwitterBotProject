@@ -1,15 +1,15 @@
 name: X 自動リツイート Bot (スケジュール)
 
 on:
-  workflow_dispatch:
+  workflow_dispatch:   # 手動実行を許可
   # schedule:
-  #   - cron: '0 */3 * * *'
+  #   - cron: '0 */3 * * *'   # 3時間ごとに実行 (UTC基準)
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
 
-    # 認証情報は Secrets から設定
+    # 認証情報は GitHub Secrets から安全に読み込む
     env:
       API_KEY: ${{ secrets.API_KEY }}
       API_SECRET: ${{ secrets.API_SECRET }}
@@ -17,35 +17,65 @@ jobs:
       ACCESS_TOKEN_SECRET: ${{ secrets.ACCESS_TOKEN_SECRET }}
 
     steps:
-      - name: チェックアウト
+      - name: コードをチェックアウト
         uses: actions/checkout@v4
 
-      - name: Python セットアップ
+      - name: Python 環境をセットアップ
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: 定数設定読み込み (config.env)
-        run: |
-          # config.env から定数を読み込み、GITHUB_ENV に注入
-          echo "読み込み config.env"
-          for var in KEYWORDS POLL_MAX_RESULTS MAX_RETWEETS_PER_RUN DRY_RUN LOOKBACK_HOURS LOG_LEVEL STATE_FILE; do
-            echo "$var=$(grep -E \"^$var=\" config.env | cut -d'=' -f2-)" >> $GITHUB_ENV
-          done
-
-      - name: 依存パッケージインストール
+      - name: 依存パッケージをインストール
         run: |
           pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: 環境変数存在チェック
+      - name: config.env の読み込みと環境変数注入
         run: |
+          echo "=== config.env の内容を読み込みます ==="
+          if [ ! -f "config.env" ]; then
+            echo "❌ config.env ファイルが見つかりません。処理を終了します。"
+            exit 1
+          fi
+
+          # config.env から変数を安全に読み込んで GITHUB_ENV に書き込み
+          while IFS='=' read -r key value; do
+            # コメント行・空行は無視
+            [[ -z "$key" || "$key" == \#* ]] && continue
+            key=$(echo "$key" | xargs)
+            value=$(echo "$value" | xargs)
+            if [[ -z "$value" ]]; then
+              echo "⚠️ 環境変数 $key の値が空です。"
+            fi
+            echo "$key=$value" >> $GITHUB_ENV
+          done < config.env
+
+          echo "=== config.env の読み込み完了 ==="
+
+      - name: 読み込んだ環境変数を確認（デバッグ目的）
+        run: |
+          echo "=== 現在の環境変数一覧 (一部マスク済) ==="
+          for var in KEYWORDS POLL_MAX_RESULTS MAX_RETWEETS_PER_RUN DRY_RUN LOOKBACK_HOURS LOG_LEVEL STATE_FILE; do
+            val="${!var}"
+            if [[ -z "$val" ]]; then
+              echo "⚠️ $var が未設定です"
+            else
+              masked=$(echo "$val" | sed 's/./*/g')
+              echo "✅ $var = ${masked:0:6} (マスク済)"
+            fi
+          done
+
+      - name: 環境変数存在チェック (Secrets)
+        run: |
+          echo "=== Secrets の存在確認 ==="
           python - <<'PY'
           import os, json
           keys = ["API_KEY","API_SECRET","ACCESS_TOKEN","ACCESS_TOKEN_SECRET"]
-          print(json.dumps({k: bool(os.getenv(k)) for k in keys}, ensure_ascii=False))
+          print(json.dumps({k: bool(os.getenv(k)) for k in keys}, ensure_ascii=False, indent=2))
           PY
 
       - name: Bot 実行
         run: |
+          echo "=== Bot 実行開始 ==="
           python bot.py
+          echo "=== Bot 実行終了 ==="
