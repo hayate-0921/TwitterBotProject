@@ -1,228 +1,179 @@
-#!/usr/bin/env python3
-"""
-bot.py — X 自動リツイート Bot（最小構成版）
-
-機能：
-1. 認証
-2. ホームタイムライン取得
-3. 各ツイートにフィルタ（RT/Reply 除外、キーワード、投稿時間）適用
-4. DRY_RUN に応じてリツイート実行
-5. state.json に処理済みツイート ID を記録
-
-注意：
-- 現時点では state.json は Runner ローカルに保存されるのみ（GitHub Actions 間の永続化はなし）
-- 将来的に commit/push や DB 移行を検討
-"""
-
 import os
-import re
 import json
 import logging
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
+import requests
 
-import tweepy
-from dotenv import load_dotenv
-
-load_dotenv()
-
-# ---------- 設定読み込み ----------
-API_KEY = os.getenv("API_KEY")
-API_SECRET = os.getenv("API_SECRET")
-ACCESS_TOKEN = os.getenv("ACCESS_TOKEN")
-ACCESS_TOKEN_SECRET = os.getenv("ACCESS_TOKEN_SECRET")
-
-KEYWORDS_PATTERN = os.getenv("KEYWORDS", "歌枠|歌ってみた|cover|カバー")
-POLL_MAX_RESULTS = int(os.getenv("POLL_MAX_RESULTS", "50"))
-MAX_RETWEETS_PER_RUN = int(os.getenv("MAX_RETWEETS_PER_RUN", "1"))
-DRY_RUN = os.getenv("DRY_RUN", "true").lower() in ("1", "true", "yes")
-LOOKBACK_HOURS = int(os.getenv("LOOKBACK_HOURS", "3"))
+# ------------------------------------------------------------
+# ログ設定
+# ------------------------------------------------------------
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-STATE_FILE = os.getenv("STATE_FILE", "state.json")
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
 
-logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO),
-                    format="%(asctime)s %(levelname)s %(message)s")
-logger = logging.getLogger("自動リツイートBot")
+# ------------------------------------------------------------
+# 環境変数取得関数群
+# ------------------------------------------------------------
+def get_env_str(var_name: str, default: str = "") -> str:
+    """
+    文字列型の環境変数を取得し、内容をログに出力する。
 
-def load_state(path):
-    """
-    state.json を読み込んで処理済みツイート ID のリストを返す。
-    エラー時は空リストを返す。
-    """
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except FileNotFoundError:
-        return {"processed_ids": []}
-    except Exception as e:
-        logger.warning("state 読み込み失敗: %s", e)
-        return {"processed_ids": []}
+    Args:
+        var_name (str): 環境変数名
+        default (str): デフォルト値
 
-def save_state(path, state):
+    Returns:
+        str: 環境変数の値（文字列）
     """
-    state を state.json に保存する。
-    """
-    try:
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(state, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        logger.error("state 保存失敗: %s", e)
+    raw_value = os.getenv(var_name, default)
+    logging.info(f"[DEBUG] 環境変数 {var_name}: '{raw_value}' (型: {type(raw_value).__name__})")
+    if raw_value == "":
+        logging.warning(f"[WARN] 環境変数 {var_name} が設定されていません。デフォルト値 '{default}' を使用します。")
+    return raw_value
 
-def make_client():
-    """
-    Tweepy Client を生成して返す。
-    必須環境変数が揃っていない場合は例外を投げる。
-    """
-    if not all([API_KEY, API_SECRET, ACCESS_TOKEN, ACCESS_TOKEN_SECRET]):
-        logger.error("環境変数が不足しています。API_KEY などを確認してください。")
-        raise RuntimeError("認証情報不足")
-    client = tweepy.Client(
-        consumer_key=API_KEY,
-        consumer_secret=API_SECRET,
-        access_token=ACCESS_TOKEN,
-        access_token_secret=ACCESS_TOKEN_SECRET,
-        wait_on_rate_limit=True
-    )
-    return client
 
-def is_retweet_or_reply(tweet):
+def get_env_int(var_name: str, default: int) -> int:
     """
-    ツイートがリツイート／リプライ／引用投稿かどうかを判定する。
-    引数:
-     - tweet: tweepy.Tweet オブジェクトまたはその類似オブジェクト
-    戻り値:
-     - True: RT/Reply/Quote のいずれか
-     - False: 通常のツイート
+    整数型の環境変数を取得し、変換結果をログに出力する。
+
+    Args:
+        var_name (str): 環境変数名
+        default (int): デフォルト値
+
+    Returns:
+        int: 整数型の値
     """
-    try:
-        refs = getattr(tweet, "referenced_tweets", None) or getattr(tweet, "data", {}).get("referenced_tweets")
-    except Exception:
-        refs = None
-    if not refs:
-        return False
-    for r in refs:
-        rtype = r.get("type") if isinstance(r, dict) else getattr(r, "type", None)
-        if rtype in ("retweeted", "replied_to", "quoted"):
-            return True
-    return False
+    raw_value = os.getenv(var_name, "")
+    logging.info(f"[DEBUG] 取得した環境変数 {var_name} の値: '{raw_value}' (型: {type(raw_value).__name__})")
 
-keyword_re = re.compile(KEYWORDS_PATTERN, flags=re.IGNORECASE)
-
-def matches_keywords(text: str) -> bool:
-    """
-    テキストにキーワードが含まれているかを判定する。
-    引数:
-     - text: ツイート本文文字列
-    戻り値:
-     - True: キーワードのいずれかにマッチ
-     - False: マッチせず
-    """
-    if not text:
-        return False
-    return bool(keyword_re.search(text))
-
-def get_created_at(tweet):
-    """
-    ツイートの作成日時 (datetime) を返す。UTC基準。
-    引数:
-     - tweet: tweepy.Tweet オブジェクト
-    戻り値:
-     - datetime オブジェクト（UTC） または None（取得不能時）
-    """
-    dt = getattr(tweet, "created_at", None)
-    if isinstance(dt, datetime):
-        return dt
-    try:
-        raw = getattr(tweet, "data", {}).get("created_at")
-        if raw:
-            return datetime.fromisoformat(raw.replace("Z", "+00:00"))
-    except Exception:
-        pass
-    return None
-
-def run_once():
-    logger.info("処理開始 (DRY_RUN=%s)", DRY_RUN)
-    state = load_state(STATE_FILE)
-    processed = set(state.get("processed_ids", []))
-
-    client = make_client()
-
-    me = client.get_me().data
-    my_user_id = str(getattr(me, "id", None))
-    logger.info("認証成功: id=%s username=%s", getattr(me, "id", None), getattr(me, "username", None))
-
-    now = datetime.now(timezone.utc)
-    cutoff = now - timedelta(hours=LOOKBACK_HOURS)
+    if raw_value == "":
+        logging.warning(f"[WARN] 環境変数 {var_name} が空文字です。デフォルト値 {default} を使用します。")
+        return default
 
     try:
-        resp = client.get_home_timeline(
-            max_results=POLL_MAX_RESULTS,
-            tweet_fields=["created_at", "referenced_tweets", "author_id", "text"]
-        )
-    except Exception as e:
-        logger.exception("ホームタイムライン取得失敗: %s", e)
-        return
+        converted = int(raw_value)
+        logging.info(f"[DEBUG] {var_name} を整数型に変換しました: {converted}")
+        return converted
+    except ValueError:
+        logging.error(f"[ERROR] 環境変数 {var_name}='{raw_value}' は整数に変換できません。デフォルト値 {default} を使用します。")
+        return default
 
-    tweets = getattr(resp, "data", None) or []
-    logger.info("取得ツイート数 (生データ) = %d", len(tweets))
 
-    tweets = list(reversed(tweets))
-    retweeted_count = 0
+def ensure_required_env(vars_required):
+    """
+    必須環境変数の存在確認を行う。未設定の変数がある場合はエラー終了する。
 
-    for t in tweets:
-        tid = str(getattr(t, "id", None) or (getattr(t, "data", {}) or {}).get("id"))
-        if not tid:
-            continue
-        if tid in processed:
-            continue
+    Args:
+        vars_required (list[str]): 必須変数名のリスト
+    """
+    missing = [v for v in vars_required if not os.getenv(v)]
+    if missing:
+        logging.critical(f"[FATAL] 必須環境変数が未設定です: {', '.join(missing)}")
+        raise EnvironmentError(f"Missing required environment variables: {', '.join(missing)}")
 
-        created_at = get_created_at(t)
-        if not created_at:
-            logger.debug("作成日時取得失敗: %s をスキップ", tid)
-            processed.add(tid)
-            continue
 
-        if created_at < cutoff:
-            logger.debug("ツイート %s は基準日時 %s より古い (%s) → スキップ", tid, cutoff, created_at)
-            processed.add(tid)
-            continue
+# ------------------------------------------------------------
+# 環境変数の取得
+# ------------------------------------------------------------
+ensure_required_env(["BEARER_TOKEN", "SEARCH_QUERY"])
 
-        if is_retweet_or_reply(t):
-            logger.debug("ツイート %s は RT/返信/引用 → スキップ", tid)
-            processed.add(tid)
-            continue
+BEARER_TOKEN = get_env_str("BEARER_TOKEN")
+SEARCH_QUERY = get_env_str("SEARCH_QUERY")
+POLL_MAX_RESULTS = get_env_int("POLL_MAX_RESULTS", 50)
+POLL_HOURS = get_env_int("POLL_HOURS", 3)
 
-        text = getattr(t, "text", None) or (getattr(t, "data", {}) or {}).get("text", "")
-        text_preview = text.replace("\n", " ")[:140]
-        if not matches_keywords(text):
-            logger.debug("ツイート %s はキーワード未一致 → スキップ 内容=%s", tid, text_preview)
-            processed.add(tid)
-            continue
+# ------------------------------------------------------------
+# Twitter API関連
+# ------------------------------------------------------------
+def create_headers(bearer_token: str) -> dict:
+    """
+    API認証用のHTTPヘッダーを生成する。
 
-        logger.info("対象候補: %s 投稿者=%s 内容=%s", tid, getattr(t, "author_id", (getattr(t, "data", {}) or {}).get("author_id")), text_preview)
+    Args:
+        bearer_token (str): X（旧Twitter）APIのベアラートークン
 
-        if retweeted_count >= MAX_RETWEETS_PER_RUN:
-            logger.info("本実行のリツイート上限 %d に達したため、以降処理を中止します", MAX_RETWEETS_PER_RUN)
-            break
+    Returns:
+        dict: 認証ヘッダー
+    """
+    return {"Authorization": f"Bearer {bearer_token}"}
 
-        if DRY_RUN:
-            logger.info("DRY_RUN モード: %s をリツイート (実行せず)", tid)
-            processed.add(tid)
-            retweeted_count += 1
-        else:
-            try:
-                resp_rt = client.retweet(tweet_id=tid)
-                logger.info("リツイート成功: %s レスポンス=%s", tid, getattr(resp_rt, "data", str(resp_rt)))
-                processed.add(tid)
-                retweeted_count += 1
-            except Exception as e:
-                logger.exception("リツイート失敗: %s エラー=%s", tid, e)
-                processed.add(tid)
-                continue
 
-    state["processed_ids"] = list(processed)
-    save_state(STATE_FILE, state)
-    logger.info("処理終了 リツイート件数=%d, 総処理済み件数=%d", retweeted_count, len(processed))
+def get_recent_tweets(query: str, hours: int, max_results: int) -> list[dict]:
+    """
+    指定時間内に投稿されたツイートを取得する。
+
+    Args:
+        query (str): 検索クエリ（例："Python OR AI"）
+        hours (int): 取得対象とする過去時間（単位：時間）
+        max_results (int): 取得する最大件数（10〜100）
+
+    Returns:
+        list[dict]: ツイート情報のリスト
+    """
+    logging.info(f"[INFO] ツイート取得を開始します。検索クエリ: '{query}', 対象時間: 過去{hours}時間")
+
+    headers = create_headers(BEARER_TOKEN)
+    endpoint = "https://api.twitter.com/2/tweets/search/recent"
+
+    now_utc = datetime.now(timezone.utc)
+    start_time = now_utc - timedelta(hours=hours)
+
+    params = {
+        "query": query,
+        "max_results": max_results,
+        "start_time": start_time.isoformat(timespec="seconds"),
+        "tweet.fields": "id,text,created_at,author_id",
+    }
+
+    response = requests.get(endpoint, headers=headers, params=params)
+
+    if response.status_code != 200:
+        logging.error(f"[ERROR] API呼び出しに失敗しました。ステータスコード: {response.status_code}")
+        logging.error(response.text)
+        return []
+
+    data = response.json().get("data", [])
+    logging.info(f"[INFO] {len(data)} 件のツイートを取得しました。")
+    return data
+
+
+def save_tweets_to_json(tweets: list[dict], filename: str = "tweets.json") -> None:
+    """
+    取得したツイートをJSONファイルとして保存する。
+
+    Args:
+        tweets (list[dict]): ツイートのリスト
+        filename (str): 保存先ファイル名（デフォルト: tweets.json）
+    """
+    with open(filename, "w", encoding="utf-8") as f:
+        json.dump(tweets, f, ensure_ascii=False, indent=2)
+    logging.info(f"[INFO] ツイート情報を '{filename}' に保存しました。")
+
+
+# ------------------------------------------------------------
+# メイン処理
+# ------------------------------------------------------------
+def main():
+    """
+    メイン実行関数。
+    指定された条件でツイートを取得し、結果をファイルに保存する。
+    """
+    logging.info("========== Bot実行開始 ==========")
+    tweets = get_recent_tweets(SEARCH_QUERY, POLL_HOURS, POLL_MAX_RESULTS)
+
+    if not tweets:
+        logging.warning("[WARN] ツイートが取得できませんでした。")
+    else:
+        save_tweets_to_json(tweets)
+
+    logging.info("========== Bot実行完了 ==========")
 
 
 if __name__ == "__main__":
-    run_once()
+    try:
+        main()
+    except Exception as e:
+        logging.critical(f"[FATAL] 実行中に予期せぬエラーが発生しました: {e}")
+        raise
