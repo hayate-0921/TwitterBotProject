@@ -14,78 +14,61 @@ logging.basicConfig(
 )
 
 # ------------------------------------------------------------
-# 環境変数取得関数群
+# 共通関数：型指定に基づいて環境変数を取得
 # ------------------------------------------------------------
-def get_env_str(var_name: str, default: str = "") -> str:
+def get_typed_env(var_name: str, var_type: str, default=None):
     """
-    文字列型の環境変数を取得し、内容をログに出力する。
+    型を指定して環境変数を取得し、ログ出力を行う。
 
     Args:
         var_name (str): 環境変数名
-        default (str): デフォルト値
+        var_type (str): 取得したい型（"str", "int", "float", "bool"）
+        default (Any): 環境変数が未設定・変換失敗時のデフォルト値
 
     Returns:
-        str: 環境変数の値（文字列）
+        Any: 指定型に変換された環境変数の値
     """
-    raw_value = os.getenv(var_name, default)
-    logging.info(f"[DEBUG] 環境変数 {var_name}: '{raw_value}' (型: {type(raw_value).__name__})")
-    if raw_value == "":
-        logging.warning(f"[WARN] 環境変数 {var_name} が設定されていません。デフォルト値 '{default}' を使用します。")
-    return raw_value
+    raw_value = os.getenv(var_name)
+    logging.info(f"[DEBUG] 環境変数 {var_name} の取得値: '{raw_value}' (指定型: {var_type})")
 
-
-def get_env_int(var_name: str, default: int) -> int:
-    """
-    整数型の環境変数を取得し、変換結果をログに出力する。
-
-    Args:
-        var_name (str): 環境変数名
-        default (int): デフォルト値
-
-    Returns:
-        int: 整数型の値
-    """
-    raw_value = os.getenv(var_name, "")
-    logging.info(f"[DEBUG] 取得した環境変数 {var_name} の値: '{raw_value}' (型: {type(raw_value).__name__})")
-
-    if raw_value == "":
-        logging.warning(f"[WARN] 環境変数 {var_name} が空文字です。デフォルト値 {default} を使用します。")
+    if raw_value is None or raw_value == "":
+        logging.warning(f"[WARN] 環境変数 {var_name} が設定されていません。デフォルト値 {default} を使用します。")
         return default
 
     try:
-        converted = int(raw_value)
-        logging.info(f"[DEBUG] {var_name} を整数型に変換しました: {converted}")
+        if var_type == "int":
+            converted = int(raw_value)
+        elif var_type == "float":
+            converted = float(raw_value)
+        elif var_type == "bool":
+            converted = raw_value.lower() in ["true", "1", "yes"]
+        elif var_type == "str":
+            converted = str(raw_value)
+        else:
+            raise ValueError(f"不明な型指定: {var_type}")
+
+        logging.info(f"[DEBUG] {var_name} を {var_type} 型に変換しました: {converted}")
         return converted
-    except ValueError:
-        logging.error(f"[ERROR] 環境変数 {var_name}='{raw_value}' は整数に変換できません。デフォルト値 {default} を使用します。")
+
+    except Exception as e:
+        logging.error(f"[ERROR] 環境変数 {var_name} の変換に失敗しました: {e}。デフォルト値 {default} を使用します。")
         return default
 
 
-def ensure_required_env(vars_required):
+def ensure_required_env(required_vars: list[str]):
     """
-    必須環境変数の存在確認を行う。未設定の変数がある場合はエラー終了する。
+    必須環境変数が設定されているか確認する。
 
     Args:
-        vars_required (list[str]): 必須変数名のリスト
+        required_vars (list[str]): 必須変数名のリスト
     """
-    missing = [v for v in vars_required if not os.getenv(v)]
+    missing = [v for v in required_vars if not os.getenv(v)]
     if missing:
         logging.critical(f"[FATAL] 必須環境変数が未設定です: {', '.join(missing)}")
         raise EnvironmentError(f"Missing required environment variables: {', '.join(missing)}")
 
-
 # ------------------------------------------------------------
-# 環境変数の取得
-# ------------------------------------------------------------
-ensure_required_env(["BEARER_TOKEN", "SEARCH_QUERY"])
-
-BEARER_TOKEN = get_env_str("BEARER_TOKEN")
-SEARCH_QUERY = get_env_str("SEARCH_QUERY")
-POLL_MAX_RESULTS = get_env_int("POLL_MAX_RESULTS", 50)
-POLL_HOURS = get_env_int("POLL_HOURS", 3)
-
-# ------------------------------------------------------------
-# Twitter API関連
+# Twitter API関連関数
 # ------------------------------------------------------------
 def create_headers(bearer_token: str) -> dict:
     """
@@ -100,21 +83,22 @@ def create_headers(bearer_token: str) -> dict:
     return {"Authorization": f"Bearer {bearer_token}"}
 
 
-def get_recent_tweets(query: str, hours: int, max_results: int) -> list[dict]:
+def get_recent_tweets(query: str, hours: int, max_results: int, bearer_token: str) -> list[dict]:
     """
     指定時間内に投稿されたツイートを取得する。
 
     Args:
-        query (str): 検索クエリ（例："Python OR AI"）
-        hours (int): 取得対象とする過去時間（単位：時間）
-        max_results (int): 取得する最大件数（10〜100）
+        query (str): 検索クエリ
+        hours (int): 過去何時間分を取得するか
+        max_results (int): 最大取得件数
+        bearer_token (str): API認証用トークン
 
     Returns:
         list[dict]: ツイート情報のリスト
     """
-    logging.info(f"[INFO] ツイート取得を開始します。検索クエリ: '{query}', 対象時間: 過去{hours}時間")
+    logging.info(f"[INFO] ツイート取得開始：クエリ='{query}', 対象時間={hours}時間以内")
 
-    headers = create_headers(BEARER_TOKEN)
+    headers = create_headers(bearer_token)
     endpoint = "https://api.twitter.com/2/tweets/search/recent"
 
     now_utc = datetime.now(timezone.utc)
@@ -130,13 +114,12 @@ def get_recent_tweets(query: str, hours: int, max_results: int) -> list[dict]:
     response = requests.get(endpoint, headers=headers, params=params)
 
     if response.status_code != 200:
-        logging.error(f"[ERROR] API呼び出しに失敗しました。ステータスコード: {response.status_code}")
-        logging.error(response.text)
+        logging.error(f"[ERROR] API呼び出し失敗（{response.status_code}）: {response.text}")
         return []
 
-    data = response.json().get("data", [])
-    logging.info(f"[INFO] {len(data)} 件のツイートを取得しました。")
-    return data
+    tweets = response.json().get("data", [])
+    logging.info(f"[INFO] {len(tweets)}件のツイートを取得しました。")
+    return tweets
 
 
 def save_tweets_to_json(tweets: list[dict], filename: str = "tweets.json") -> None:
@@ -144,8 +127,8 @@ def save_tweets_to_json(tweets: list[dict], filename: str = "tweets.json") -> No
     取得したツイートをJSONファイルとして保存する。
 
     Args:
-        tweets (list[dict]): ツイートのリスト
-        filename (str): 保存先ファイル名（デフォルト: tweets.json）
+        tweets (list[dict]): ツイートリスト
+        filename (str): 保存先ファイル名
     """
     with open(filename, "w", encoding="utf-8") as f:
         json.dump(tweets, f, ensure_ascii=False, indent=2)
@@ -157,12 +140,36 @@ def save_tweets_to_json(tweets: list[dict], filename: str = "tweets.json") -> No
 # ------------------------------------------------------------
 def main():
     """
-    メイン実行関数。
-    指定された条件でツイートを取得し、結果をファイルに保存する。
+    メイン処理。
+    環境変数を型指定で取得し、条件に合致するツイートを取得・保存する。
     """
     logging.info("========== Bot実行開始 ==========")
-    tweets = get_recent_tweets(SEARCH_QUERY, POLL_HOURS, POLL_MAX_RESULTS)
 
+    # 必須変数チェック
+    ensure_required_env(["BEARER_TOKEN", "SEARCH_QUERY"])
+
+    # ここで全環境変数を一括取得・型を整える
+    config = {
+        "BEARER_TOKEN": get_typed_env("BEARER_TOKEN", "str"),
+        "SEARCH_QUERY": get_typed_env("SEARCH_QUERY", "str"),
+        "POLL_MAX_RESULTS": get_typed_env("POLL_MAX_RESULTS", "int", 50),
+        "POLL_HOURS": get_typed_env("POLL_HOURS", "int", 3),
+        "LOG_LEVEL": get_typed_env("LOG_LEVEL", "str", "INFO"),
+    }
+
+    logging.info("[INFO] 設定内容:")
+    for key, val in config.items():
+        logging.info(f"    {key} = {val} (型: {type(val).__name__})")
+
+    # ツイート取得
+    tweets = get_recent_tweets(
+        query=config["SEARCH_QUERY"],
+        hours=config["POLL_HOURS"],
+        max_results=config["POLL_MAX_RESULTS"],
+        bearer_token=config["BEARER_TOKEN"],
+    )
+
+    # 取得結果を保存
     if not tweets:
         logging.warning("[WARN] ツイートが取得できませんでした。")
     else:
@@ -171,9 +178,12 @@ def main():
     logging.info("========== Bot実行完了 ==========")
 
 
+# ------------------------------------------------------------
+# エントリポイント
+# ------------------------------------------------------------
 if __name__ == "__main__":
     try:
         main()
     except Exception as e:
-        logging.critical(f"[FATAL] 実行中に予期せぬエラーが発生しました: {e}")
+        logging.critical(f"[FATAL] 実行中にエラーが発生しました: {e}")
         raise
