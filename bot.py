@@ -1,189 +1,159 @@
 import os
+import re
 import json
+import time
 import logging
-from datetime import datetime, timedelta, timezone
-import requests
+from datetime import datetime, timedelta
+import tweepy
+from dotenv import load_dotenv
 
-# ------------------------------------------------------------
-# ログ設定
-# ------------------------------------------------------------
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL, logging.INFO),
-    format="%(asctime)s [%(levelname)s] %(message)s",
-)
-
-# ------------------------------------------------------------
-# 共通関数：型指定に基づいて環境変数を取得
-# ------------------------------------------------------------
-def get_typed_env(var_name: str, var_type: str, default=None):
+# =========================================================
+# 環境変数読み込みと型変換
+# =========================================================
+def load_env_var(name: str, var_type: str):
     """
-    型を指定して環境変数を取得し、ログ出力を行う。
-
-    Args:
-        var_name (str): 環境変数名
-        var_type (str): 取得したい型（"str", "int", "float", "bool"）
-        default (Any): 環境変数が未設定・変換失敗時のデフォルト値
-
-    Returns:
-        Any: 指定型に変換された環境変数の値
+    指定した型で環境変数を取得する。
+    - name: 環境変数名
+    - var_type: "str" | "int" | "bool" | "float"
     """
-    raw_value = os.getenv(var_name)
-    logging.info(f"[DEBUG] 環境変数 {var_name} の取得値: '{raw_value}' (指定型: {var_type})")
+    value = os.getenv(name)
+    if value is None:
+        raise ValueError(f"環境変数 '{name}' が設定されていません。")
 
-    if raw_value is None or raw_value == "":
-        logging.warning(f"[WARN] 環境変数 {var_name} が設定されていません。デフォルト値 {default} を使用します。")
-        return default
-
-    try:
-        if var_type == "int":
-            converted = int(raw_value)
-        elif var_type == "float":
-            converted = float(raw_value)
-        elif var_type == "bool":
-            converted = raw_value.lower() in ["true", "1", "yes"]
-        elif var_type == "str":
-            converted = str(raw_value)
-        else:
-            raise ValueError(f"不明な型指定: {var_type}")
-
-        logging.info(f"[DEBUG] {var_name} を {var_type} 型に変換しました: {converted}")
-        return converted
-
-    except Exception as e:
-        logging.error(f"[ERROR] 環境変数 {var_name} の変換に失敗しました: {e}。デフォルト値 {default} を使用します。")
-        return default
-
-
-def ensure_required_env(required_vars: list[str]):
-    """
-    必須環境変数が設定されているか確認する。
-
-    Args:
-        required_vars (list[str]): 必須変数名のリスト
-    """
-    missing = [v for v in required_vars if not os.getenv(v)]
-    if missing:
-        logging.critical(f"[FATAL] 必須環境変数が未設定です: {', '.join(missing)}")
-        raise EnvironmentError(f"Missing required environment variables: {', '.join(missing)}")
-
-# ------------------------------------------------------------
-# Twitter API関連関数
-# ------------------------------------------------------------
-def create_headers(bearer_token: str) -> dict:
-    """
-    API認証用のHTTPヘッダーを生成する。
-
-    Args:
-        bearer_token (str): X（旧Twitter）APIのベアラートークン
-
-    Returns:
-        dict: 認証ヘッダー
-    """
-    return {"Authorization": f"Bearer {bearer_token}"}
-
-
-def get_recent_tweets(query: str, hours: int, max_results: int, bearer_token: str) -> list[dict]:
-    """
-    指定時間内に投稿されたツイートを取得する。
-
-    Args:
-        query (str): 検索クエリ
-        hours (int): 過去何時間分を取得するか
-        max_results (int): 最大取得件数
-        bearer_token (str): API認証用トークン
-
-    Returns:
-        list[dict]: ツイート情報のリスト
-    """
-    logging.info(f"[INFO] ツイート取得開始：クエリ='{query}', 対象時間={hours}時間以内")
-
-    headers = create_headers(bearer_token)
-    endpoint = "https://api.twitter.com/2/tweets/search/recent"
-
-    now_utc = datetime.now(timezone.utc)
-    start_time = now_utc - timedelta(hours=hours)
-
-    params = {
-        "query": query,
-        "max_results": max_results,
-        "start_time": start_time.isoformat(timespec="seconds"),
-        "tweet.fields": "id,text,created_at,author_id",
-    }
-
-    response = requests.get(endpoint, headers=headers, params=params)
-
-    if response.status_code != 200:
-        logging.error(f"[ERROR] API呼び出し失敗（{response.status_code}）: {response.text}")
-        return []
-
-    tweets = response.json().get("data", [])
-    logging.info(f"[INFO] {len(tweets)}件のツイートを取得しました。")
-    return tweets
-
-
-def save_tweets_to_json(tweets: list[dict], filename: str = "tweets.json") -> None:
-    """
-    取得したツイートをJSONファイルとして保存する。
-
-    Args:
-        tweets (list[dict]): ツイートリスト
-        filename (str): 保存先ファイル名
-    """
-    with open(filename, "w", encoding="utf-8") as f:
-        json.dump(tweets, f, ensure_ascii=False, indent=2)
-    logging.info(f"[INFO] ツイート情報を '{filename}' に保存しました。")
-
-
-# ------------------------------------------------------------
-# メイン処理
-# ------------------------------------------------------------
-def main():
-    """
-    メイン処理。
-    環境変数を型指定で取得し、条件に合致するツイートを取得・保存する。
-    """
-    logging.info("========== Bot実行開始 ==========")
-
-    # 必須変数チェック
-    ensure_required_env(["BEARER_TOKEN", "SEARCH_QUERY"])
-
-    # ここで全環境変数を一括取得・型を整える
-    config = {
-        "BEARER_TOKEN": get_typed_env("BEARER_TOKEN", "str"),
-        "SEARCH_QUERY": get_typed_env("SEARCH_QUERY", "str"),
-        "POLL_MAX_RESULTS": get_typed_env("POLL_MAX_RESULTS", "int", 50),
-        "POLL_HOURS": get_typed_env("POLL_HOURS", "int", 3),
-        "LOG_LEVEL": get_typed_env("LOG_LEVEL", "str", "INFO"),
-    }
-
-    logging.info("[INFO] 設定内容:")
-    for key, val in config.items():
-        logging.info(f"    {key} = {val} (型: {type(val).__name__})")
-
-    # ツイート取得
-    tweets = get_recent_tweets(
-        query=config["SEARCH_QUERY"],
-        hours=config["POLL_HOURS"],
-        max_results=config["POLL_MAX_RESULTS"],
-        bearer_token=config["BEARER_TOKEN"],
-    )
-
-    # 取得結果を保存
-    if not tweets:
-        logging.warning("[WARN] ツイートが取得できませんでした。")
+    if var_type == "int":
+        return int(value)
+    elif var_type == "float":
+        return float(value)
+    elif var_type == "bool":
+        return value.lower() in ("true", "1", "yes", "y", "t")
+    elif var_type == "str":
+        return value.strip()
     else:
-        save_tweets_to_json(tweets)
+        raise ValueError(f"サポートされていない型指定です: {var_type}")
 
-    logging.info("========== Bot実行完了 ==========")
+# =========================================================
+# Tweepy クライアント生成
+# =========================================================
+def create_client():
+    """
+    GitHub Secrets で管理されている認証トークンを使用してクライアントを作成。
+    """
+    bearer_token = os.getenv("TWITTER_BEARER_TOKEN")
+    api_key = os.getenv("TWITTER_API_KEY")
+    api_secret = os.getenv("TWITTER_API_SECRET")
+    access_token = os.getenv("TWITTER_ACCESS_TOKEN")
+    access_secret = os.getenv("TWITTER_ACCESS_SECRET")
 
+    if not all([bearer_token, api_key, api_secret, access_token, access_secret]):
+        raise RuntimeError("必要なAPIキーまたはトークンが環境変数に設定されていません。")
 
-# ------------------------------------------------------------
-# エントリポイント
-# ------------------------------------------------------------
+    client = tweepy.Client(
+        bearer_token=bearer_token,
+        consumer_key=api_key,
+        consumer_secret=api_secret,
+        access_token=access_token,
+        access_token_secret=access_secret,
+        wait_on_rate_limit=True
+    )
+    return client
+
+# =========================================================
+# ログ設定
+# =========================================================
+def setup_logger(log_level: str):
+    numeric_level = getattr(logging, log_level.upper(), logging.INFO)
+    logging.basicConfig(level=numeric_level, format="[%(asctime)s] %(levelname)s: %(message)s")
+
+# =========================================================
+# 状態ファイル操作
+# =========================================================
+def load_state(state_file: str):
+    if os.path.exists(state_file):
+        with open(state_file, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+def save_state(state_file: str, state_data: dict):
+    with open(state_file, "w", encoding="utf-8") as f:
+        json.dump(state_data, f, ensure_ascii=False, indent=2)
+
+# =========================================================
+# ツイート検索処理
+# =========================================================
+def search_tweets(client, query: str, lookback_hours: int, max_results: int):
+    start_time = datetime.utcnow() - timedelta(hours=lookback_hours)
+    tweets = client.search_recent_tweets(
+        query=query,
+        tweet_fields=["id", "text", "author_id", "created_at"],
+        max_results=max_results
+    )
+    if tweets.data is None:
+        return []
+    return [t for t in tweets.data if t.created_at >= start_time]
+
+# =========================================================
+# Retweet 実行
+# =========================================================
+def retweet_tweets(client, tweets, state_data, max_retweets: int, dry_run: bool):
+    retweeted_count = 0
+    for tweet in tweets:
+        if str(tweet.id) in state_data.get("retweeted_ids", []):
+            continue
+
+        logging.info(f"対象ツイート: https://twitter.com/i/web/status/{tweet.id}")
+
+        if not dry_run:
+            try:
+                client.retweet(tweet.id)
+                logging.info("→ Retweet 成功")
+            except Exception as e:
+                logging.error(f"Retweet 失敗: {e}")
+                continue
+        else:
+            logging.info("DRY_RUN モードのためRetweetは実行されません")
+
+        state_data.setdefault("retweeted_ids", []).append(str(tweet.id))
+        retweeted_count += 1
+        if retweeted_count >= max_retweets:
+            break
+    return retweeted_count
+
+# =========================================================
+# main
+# =========================================================
+def main():
+    # .env (config.env) の読み込み
+    load_dotenv("config.env")
+
+    # --- 環境変数読み込みと型変換 ---
+    KEYWORDS = load_env_var("KEYWORDS", "str")
+    POLL_MAX_RESULTS = load_env_var("POLL_MAX_RESULTS", "int")
+    MAX_RETWEETS_PER_RUN = load_env_var("MAX_RETWEETS_PER_RUN", "int")
+    DRY_RUN = load_env_var("DRY_RUN", "bool")
+    LOOKBACK_HOURS = load_env_var("LOOKBACK_HOURS", "int")
+    LOG_LEVEL = load_env_var("LOG_LEVEL", "str")
+    STATE_FILE = load_env_var("STATE_FILE", "str")
+
+    setup_logger(LOG_LEVEL)
+    logging.info("Bot 実行開始")
+
+    client = create_client()
+    state_data = load_state(STATE_FILE)
+
+    # 検索クエリ作成
+    query = f"({KEYWORDS}) -is:retweet"
+
+    # ツイート検索
+    tweets = search_tweets(client, query, LOOKBACK_HOURS, POLL_MAX_RESULTS)
+    logging.info(f"検索ヒット数: {len(tweets)}")
+
+    # Retweet実行
+    count = retweet_tweets(client, tweets, state_data, MAX_RETWEETS_PER_RUN, DRY_RUN)
+    logging.info(f"実行済みRetweet数: {count}")
+
+    # 状態ファイル更新
+    save_state(STATE_FILE, state_data)
+    logging.info("Bot 実行終了")
+
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        logging.critical(f"[FATAL] 実行中にエラーが発生しました: {e}")
-        raise
+    main()
